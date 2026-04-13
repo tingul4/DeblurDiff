@@ -100,7 +100,7 @@ class Diffusion(nn.Module):
 
         return loss
 
-    def p_losses(self, model, x_start, t, cond):
+    def p_losses(self, model, x_start, t, cond, return_dict=False):
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output, lr_kpn = model(x_noisy, t, cond)
@@ -118,6 +118,7 @@ class Diffusion(nn.Module):
         loss_kpn = self.get_loss(lr_kpn, x_start, mean=False).mean()
         loss = loss_kpn + loss_simple
 
+        loss_gate = torch.tensor(0.0, device=x_start.device)
         # EAC gate supervision loss (if model supports it)
         if hasattr(model, 'module'):
             # Accelerate wraps model
@@ -128,4 +129,11 @@ class Diffusion(nn.Module):
             loss_gate = real_model.compute_gate_loss(cond)
             loss = loss + loss_gate
 
+        if return_dict:
+            return loss, {
+                "loss_total": loss.item(),
+                "loss_simple": loss_simple.item(),
+                "loss_kpn": loss_kpn.item(),
+                "loss_gate": loss_gate.item(),
+            }
         return loss

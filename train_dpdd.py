@@ -56,6 +56,66 @@ def log_txt_as_img(wh, xc):
     return torch.tensor(txts)
 
 
+@torch.no_grad()
+def log_validation_images(
+    pure_cldm, sampler, dataset, writer, global_step, device,
+    n_vis=4, steps=50,
+):
+    """Sample a few validation images and log to TensorBoard."""
+    pure_cldm.eval()
+    indices = list(range(0, min(len(dataset), n_vis * 10), max(1, len(dataset) // n_vis)))[:n_vis]
+
+    all_lq, all_sample = [], []
+    for idx in indices:
+        batch = dataset[idx]
+        lq = torch.tensor(batch["lq"]).permute(2, 0, 1).unsqueeze(0).float().to(device)  # (1,3,H,W)
+        gt = torch.tensor(batch["gt"]).permute(2, 0, 1).unsqueeze(0).float().to(device)
+
+        z_0 = pure_cldm.vae_encode(gt)
+        cond = pure_cldm.prepare_condition(lq, [batch["prompt"]])
+
+        if "depth" in batch:
+            depth = torch.tensor(batch["depth"]).float().to(device)
+            if depth.ndim == 2:
+                depth = depth.unsqueeze(0).unsqueeze(0)
+            elif depth.ndim == 3:
+                depth = depth.unsqueeze(1)
+            d_flat = depth.view(1, -1)
+            d_min = d_flat.min(dim=1, keepdim=True)[0].view(1, 1, 1, 1)
+            d_max = d_flat.max(dim=1, keepdim=True)[0].view(1, 1, 1, 1)
+            defocus_map = (depth - d_min) / (d_max - d_min + 1e-8)
+            defocus_map = F.interpolate(defocus_map, size=z_0.shape[-2:], mode="bilinear", align_corners=False)
+            cond["defocus_map"] = defocus_map
+
+        uncond = pure_cldm.prepare_condition(lq, [""])
+        if "defocus_map" in cond:
+            uncond["defocus_map"] = cond["defocus_map"]
+
+        h, w = z_0.shape[-2:]
+        x_T = torch.randn((1, 4, h, w), dtype=torch.float32, device=device)
+        z = sampler.sample(
+            model=pure_cldm, device=device, steps=steps,
+            batch_size=1, x_size=(4, h, w),
+            cond=cond, uncond=uncond, cfg_scale=1.0,
+            x_T=x_T, progress=False, progress_leave=False,
+            cond_fn=None, tiled=False, tile_size=512, tile_stride=256,
+        )
+        sample = pure_cldm.vae_decode(z)
+        sample = (sample + 1) / 2  # [-1,1] → [0,1]
+        lq_vis = lq.clamp(0, 1)
+
+        all_lq.append(lq_vis[0])
+        all_sample.append(sample[0].clamp(0, 1))
+
+    if all_lq:
+        grid_lq = make_grid(all_lq, nrow=n_vis, normalize=False)
+        grid_sample = make_grid(all_sample, nrow=n_vis, normalize=False)
+        grid = make_grid([grid_lq, grid_sample], nrow=1, normalize=False)
+        writer.add_image("val/lq_vs_sample", grid, global_step)
+
+    pure_cldm.train()
+
+
 def main(args) -> None:
     accelerator = Accelerator(split_batches=True)
     set_seed(231)
@@ -98,6 +158,14 @@ def main(args) -> None:
     # Create diffusion
     diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
 
+    # Count trainable parameters
+    if accelerator.is_local_main_process:
+        n_ctrl = sum(p.numel() for p in cldm.controlnet.parameters())
+        n_kpn = sum(p.numel() for p in cldm.kpn.parameters())
+        n_gate = sum(p.numel() for p in cldm.eac_gate.parameters())
+        print(f"Trainable params — ControlNet: {n_ctrl/1e6:.1f}M, "
+              f"KPN: {n_kpn/1e6:.1f}M, EAC gate: {n_gate/1e3:.1f}K")
+
     # Setup optimizer: ControlNet + KPN + EAC gate
     global_lr = cfg.train.learning_rate
     controlnet_params = list(cldm.controlnet.parameters())
@@ -129,7 +197,7 @@ def main(args) -> None:
     # Variables for monitoring
     global_step = 0
     max_steps = cfg.train.train_steps
-    step_loss = []
+    step_losses = {"total": [], "simple": [], "kpn": [], "gate": []}
     epoch = 0
     epoch_loss = []
     sampler = SpacedSampler(diffusion.betas)
@@ -160,7 +228,6 @@ def main(args) -> None:
                     if depth.ndim == 3:
                         depth = depth.unsqueeze(1)  # (B, 1, H, W)
                     # Normalise depth to [0, 1] as defocus proxy
-                    # Use per-image min-max normalisation
                     b = depth.shape[0]
                     depth_flat = depth.view(b, -1)
                     d_min = depth_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
@@ -183,30 +250,74 @@ def main(args) -> None:
                     cond["defocus_map"] = defocus
 
             t = torch.randint(0, diffusion.num_timesteps, (z_0.shape[0],), device=device)
-            loss = diffusion.p_losses(cldm, z_0, t, cond)
+            loss, loss_dict = diffusion.p_losses(cldm, z_0, t, cond, return_dict=True)
 
             opt.zero_grad()
             accelerator.backward(loss)
+            # Gradient clipping
+            accelerator.clip_grad_norm_(
+                list(cldm.parameters()), max_norm=1.0
+            )
             opt.step()
 
             accelerator.wait_for_everyone()
 
             global_step += 1
-            step_loss.append(loss.item())
-            epoch_loss.append(loss.item())
+            step_losses["total"].append(loss_dict["loss_total"])
+            step_losses["simple"].append(loss_dict["loss_simple"])
+            step_losses["kpn"].append(loss_dict["loss_kpn"])
+            step_losses["gate"].append(loss_dict["loss_gate"])
+            epoch_loss.append(loss_dict["loss_total"])
             pbar.update(1)
             pbar.set_description(
-                f"Epoch: {epoch:04d}, Global Step: {global_step:07d}, Loss: {loss.item():.6f}"
+                f"Epoch: {epoch:04d}, Step: {global_step:07d}, "
+                f"L={loss_dict['loss_total']:.4f} "
+                f"(eps={loss_dict['loss_simple']:.4f} "
+                f"kpn={loss_dict['loss_kpn']:.4f} "
+                f"gate={loss_dict['loss_gate']:.4f})"
             )
 
-            # Log loss
+            # Log losses and metrics
             if global_step % cfg.train.log_every == 0 and global_step > 0:
-                avg_loss = accelerator.gather(
-                    torch.tensor(step_loss, device=device).unsqueeze(0)
-                ).mean().item()
-                step_loss.clear()
                 if accelerator.is_local_main_process:
-                    writer.add_scalar("loss/loss_step", avg_loss, global_step)
+                    n = len(step_losses["total"])
+                    writer.add_scalar("loss/total", sum(step_losses["total"]) / n, global_step)
+                    writer.add_scalar("loss/eps_simple", sum(step_losses["simple"]) / n, global_step)
+                    writer.add_scalar("loss/kpn", sum(step_losses["kpn"]) / n, global_step)
+                    writer.add_scalar("loss/gate", sum(step_losses["gate"]) / n, global_step)
+
+                    # Log KPN alpha (defocus→radius scale)
+                    writer.add_scalar("params/kpn_alpha", pure_cldm.kpn.alpha.item(), global_step)
+
+                    # Log EAC gate statistics (mean gate value per level)
+                    if hasattr(pure_cldm, 'eac_gate') and "defocus_map" in cond:
+                        with torch.no_grad():
+                            dm = cond["defocus_map"][:1]  # use first sample
+                            for li, gate in enumerate(pure_cldm.eac_gate.gates):
+                                g_val = gate(dm)
+                                writer.add_scalar(f"gate/level_{li:02d}_mean", g_val.mean().item(), global_step)
+                            # Also log overall gate mean across all levels
+                            g_all = torch.stack([gate(dm).mean() for gate in pure_cldm.eac_gate.gates])
+                            writer.add_scalar("gate/mean_all_levels", g_all.mean().item(), global_step)
+
+                    # Log gradient norms
+                    ctrl_grad = torch.nn.utils.clip_grad_norm_(
+                        pure_cldm.controlnet.parameters(), float('inf')
+                    )
+                    kpn_grad = torch.nn.utils.clip_grad_norm_(
+                        pure_cldm.kpn.parameters(), float('inf')
+                    )
+                    gate_grad = torch.nn.utils.clip_grad_norm_(
+                        pure_cldm.eac_gate.parameters(), float('inf')
+                    )
+                    writer.add_scalar("grad_norm/controlnet", ctrl_grad.item(), global_step)
+                    writer.add_scalar("grad_norm/kpn", kpn_grad.item(), global_step)
+                    writer.add_scalar("grad_norm/eac_gate", gate_grad.item(), global_step)
+
+                    writer.flush()
+
+                for k in step_losses:
+                    step_losses[k].clear()
 
             # Save checkpoint
             if global_step % cfg.train.ckpt_every == 0 and global_step > 0:
@@ -216,18 +327,27 @@ def main(args) -> None:
                     torch.save(checkpoint, ckpt_path)
                     print(f"Saved checkpoint to {ckpt_path}")
 
+            # Log validation images
+            if global_step % cfg.train.image_every == 0 and global_step > 0:
+                if accelerator.is_local_main_process:
+                    try:
+                        log_validation_images(
+                            pure_cldm, sampler, dataset,
+                            writer, global_step, device, n_vis=4, steps=50,
+                        )
+                    except Exception as e:
+                        print(f"Warning: validation image logging failed: {e}")
+
             accelerator.wait_for_everyone()
             if global_step == max_steps:
                 break
 
         pbar.close()
         epoch += 1
-        avg_epoch_loss = accelerator.gather(
-            torch.tensor(epoch_loss, device=device).unsqueeze(0)
-        ).mean().item()
-        epoch_loss.clear()
         if accelerator.is_local_main_process:
+            avg_epoch_loss = sum(epoch_loss) / max(len(epoch_loss), 1)
             writer.add_scalar("loss/loss_epoch", avg_epoch_loss, global_step)
+        epoch_loss.clear()
 
     if accelerator.is_local_main_process:
         print("done!")
