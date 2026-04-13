@@ -48,7 +48,7 @@ if [[ ! -f "$SD_WEIGHTS" ]]; then
 fi
 
 # Check dataset
-DATASET_ROOT=/ssd1/chingheng/Deblurring-Dataset/dd_dp_dataset_png
+DATASET_ROOT=/raid/danielchen/defous-deblur/dd_dp_dataset_png
 if [[ ! -d "$DATASET_ROOT/train_c/source" ]]; then
     echo "ERROR: DPDD dataset not found at $DATASET_ROOT"
     exit 1

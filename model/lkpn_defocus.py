@@ -151,16 +151,15 @@ class DefocusLKPN(nn.Module):
         # Generate soft disk mask and apply to kernel weights
         # mask: (B, K*K, H, W), need to expand for 4 output channels
         disk_mask = self._soft_disk_mask(radius)  # (B, K*K, H, W)
-        # Repeat mask for each of the 4 latent channels
-        disk_mask_full = disk_mask.repeat(1, 4, 1, 1)  # (B, 4*K*K, H, W)
-
-        # Apply disk mask to kernel weights
-        masked_kernel = kernel_weights * disk_mask_full
-
-        # Normalise kernel weights per group (each 5x5 kernel sums to 1)
-        # Reshape to (B, 4, K*K, H, W) for per-group normalisation
-        mk = masked_kernel.view(x.shape[0], 4, K * K, x.shape[2], x.shape[3])
-        mk_sum = mk.sum(dim=2, keepdim=True).clamp(min=1e-8)
+        # Softmax kernel weights per group to ensure non-negative values,
+        # then apply disk mask and re-normalise.  This prevents the old
+        # failure mode where positive/negative raw weights could sum to
+        # near-zero, causing division-by-epsilon to explode.
+        mk = kernel_weights.view(x.shape[0], 4, K * K, x.shape[2], x.shape[3])
+        mk = F.softmax(mk, dim=2)                       # (B,4,K*K,H,W) ≥0, Σ=1
+        disk_mask_grouped = disk_mask.unsqueeze(1)       # (B,1,K*K,H,W)
+        mk = mk * disk_mask_grouped
+        mk_sum = mk.sum(dim=2, keepdim=True).clamp(min=1e-6)
         mk = mk / mk_sum
         masked_kernel = mk.view(x.shape[0], 4 * K * K, x.shape[2], x.shape[3])
 

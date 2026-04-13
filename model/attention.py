@@ -5,9 +5,7 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
 
-from model.util import (
-    checkpoint, zero_module, exists, default
-)
+from model.util import checkpoint, zero_module, exists, default
 from model.config import Config, AttnMode
 
 # CrossAttn precision handling
@@ -28,19 +26,18 @@ class GEGLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.0):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
-        project_in = nn.Sequential(
-            nn.Linear(dim, inner_dim),
-            nn.GELU()
-        ) if not glu else GEGLU(dim, inner_dim)
+        project_in = (
+            nn.Sequential(nn.Linear(dim, inner_dim), nn.GELU())
+            if not glu
+            else GEGLU(dim, inner_dim)
+        )
 
         self.net = nn.Sequential(
-            project_in,
-            nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim_out)
+            project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out)
         )
 
     def forward(self, x):
@@ -48,19 +45,21 @@ class FeedForward(nn.Module):
 
 
 def Normalize(in_channels):
-    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+    return torch.nn.GroupNorm(
+        num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
+    )
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-#        print(
-#            f"Setting up {self.__class__.__name__} (vanilla). Query dim is {query_dim}, context_dim is {context_dim} and using "
-#            f"{heads} heads.")
+        #        print(
+        #            f"Setting up {self.__class__.__name__} (vanilla). Query dim is {query_dim}, context_dim is {context_dim} and using "
+        #            f"{heads} heads.")
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
@@ -68,8 +67,7 @@ class CrossAttention(nn.Module):
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
         self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
         )
 
     def forward(self, x, context=None, mask=None):
@@ -80,30 +78,33 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
 
         # force cast to fp32 to avoid overflowing
         if _ATTN_PRECISION == "fp32":
             # with torch.autocast(enabled=False, device_type = 'cuda'):
-            with torch.autocast(enabled=False, device_type="cuda" if str(x.device).startswith("cuda") else "cpu"):
+            with torch.autocast(
+                enabled=False,
+                device_type="cuda" if str(x.device).startswith("cuda") else "cpu",
+            ):
                 q, k = q.float(), k.float()
-                sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+                sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
         else:
-            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+            sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
 
         del q, k
 
         if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
+            mask = rearrange(mask, "b ... -> b (...)")
             max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            mask = repeat(mask, "b j -> (b h) () j", h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
         sim = sim.softmax(dim=-1)
 
-        out = einsum('b i j, b j d -> b i d', sim, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        out = einsum("b i j, b j d -> b i d", sim, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
         return self.to_out(out)
 
 
@@ -111,9 +112,9 @@ class MemoryEfficientCrossAttention(nn.Module):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-#        print(
-#            f"Setting up {self.__class__.__name__} (xformers). Query dim is {query_dim}, context_dim is {context_dim} and using "
-#            f"{heads} heads.")
+        #        print(
+        #            f"Setting up {self.__class__.__name__} (xformers). Query dim is {query_dim}, context_dim is {context_dim} and using "
+        #            f"{heads} heads.")
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -124,7 +125,9 @@ class MemoryEfficientCrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+        )
         self.attention_op: Optional[Any] = None
 
     def forward(self, x, context=None, mask=None):
@@ -135,16 +138,20 @@ class MemoryEfficientCrossAttention(nn.Module):
 
         b, _, _ = q.shape
         q, k, v = map(
-            lambda t: t.unsqueeze(3)
-            .reshape(b, t.shape[1], self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
+            lambda t: (
+                t.unsqueeze(3)
+                .reshape(b, t.shape[1], self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .reshape(b * self.heads, t.shape[1], self.dim_head)
+                .contiguous()
+            ),
             (q, k, v),
         )
 
         # actually compute the attention, what we cannot get enough of
-        out = Config.xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+        out = Config.xformers.ops.memory_efficient_attention(
+            q, k, v, attn_bias=None, op=self.attention_op
+        )
 
         if exists(mask):
             raise NotImplementedError
@@ -160,9 +167,9 @@ class MemoryEfficientCrossAttention(nn.Module):
 class SDPCrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-#        print(
-#            f"Setting up {self.__class__.__name__} (sdp). Query dim is {query_dim}, context_dim is {context_dim} and using "
-#            f"{heads} heads.")
+        #        print(
+        #            f"Setting up {self.__class__.__name__} (sdp). Query dim is {query_dim}, context_dim is {context_dim} and using "
+        #            f"{heads} heads.")
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -173,27 +180,30 @@ class SDPCrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+        )
 
     def forward(self, x, context=None, mask=None):
         q = self.to_q(x)
-        b,_,_ = q.shape
+        b, _, _ = q.shape
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
-        bk,_,_ = k.shape
-        bv,_,_ = v.shape
+        bk, _, _ = k.shape
+        bv, _, _ = v.shape
 
-        k = k.repeat(b//bk, 1, 1)
-        v = v.repeat(b//bv, 1, 1)
-
+        k = k.repeat(b // bk, 1, 1)
+        v = v.repeat(b // bv, 1, 1)
 
         q, k, v = map(
-            lambda t: t.unsqueeze(3)
-            .reshape(b, t.shape[1], self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
+            lambda t: (
+                t.unsqueeze(3)
+                .reshape(b, t.shape[1], self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .reshape(b * self.heads, t.shape[1], self.dim_head)
+                .contiguous()
+            ),
             (q, k, v),
         )
 
@@ -215,29 +225,55 @@ class BasicTransformerBlock(nn.Module):
     ATTENTION_MODES = {
         AttnMode.VANILLA: CrossAttention,  # vanilla attention
         AttnMode.XFORMERS: MemoryEfficientCrossAttention,
-        AttnMode.SDP: SDPCrossAttention
+        AttnMode.SDP: SDPCrossAttention,
     }
 
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
-                 disable_self_attn=False):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.0,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=True,
+        disable_self_attn=False,
+    ):
         super().__init__()
         attn_cls = self.ATTENTION_MODES[Config.attn_mode]
         self.disable_self_attn = disable_self_attn
-        self.attn1 = attn_cls(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
-                              context_dim=context_dim if self.disable_self_attn else None)  # is a self-attention if not self.disable_self_attn
+        self.attn1 = attn_cls(
+            query_dim=dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+            context_dim=context_dim if self.disable_self_attn else None,
+        )  # is a self-attention if not self.disable_self_attn
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim,
-                              heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+        self.attn2 = attn_cls(
+            query_dim=dim,
+            context_dim=context_dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
     def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+        return checkpoint(
+            self._forward, (x, context), self.parameters(), self.checkpoint
+        )
 
     def _forward(self, x, context=None):
-        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
+        x = (
+            self.attn1(
+                self.norm1(x), context=context if self.disable_self_attn else None
+            )
+            + x
+        )
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
@@ -253,10 +289,19 @@ class SpatialTransformer(nn.Module):
     NEW: use_linear for more efficiency instead of the 1x1 convs
     """
 
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None,
-                 disable_self_attn=False, use_linear=False,
-                 use_checkpoint=True, kernel_size=(64, 64)):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.0,
+        context_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True,
+        kernel_size=(64, 64),
+    ):
         super().__init__()
         if exists(context_dim) and not isinstance(context_dim, list):
             context_dim = [context_dim]
@@ -264,25 +309,30 @@ class SpatialTransformer(nn.Module):
         inner_dim = n_heads * d_head
         self.norm = Normalize(in_channels)
         if not use_linear:
-            self.proj_in = nn.Conv2d(in_channels,
-                                     inner_dim,
-                                     kernel_size=1,
-                                     stride=1,
-                                     padding=0)
+            self.proj_in = nn.Conv2d(
+                in_channels, inner_dim, kernel_size=1, stride=1, padding=0
+            )
         else:
             self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d],
-                                   disable_self_attn=disable_self_attn, checkpoint=use_checkpoint)
-             for d in range(depth)]
+            [
+                BasicTransformerBlock(
+                    inner_dim,
+                    n_heads,
+                    d_head,
+                    dropout=dropout,
+                    context_dim=context_dim[d],
+                    disable_self_attn=disable_self_attn,
+                    checkpoint=use_checkpoint,
+                )
+                for d in range(depth)
+            ]
         )
         if not use_linear:
-            self.proj_out = zero_module(nn.Conv2d(inner_dim,
-                                                  in_channels,
-                                                  kernel_size=1,
-                                                  stride=1,
-                                                  padding=0))
+            self.proj_out = zero_module(
+                nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
+            )
         else:
             self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
         self.use_linear = use_linear
@@ -292,7 +342,7 @@ class SpatialTransformer(nn.Module):
     def grids(self, x):
         b, c, h, w = x.shape
         self.original_size = (b, c, h, w)
-        assert b == 1
+        # assert b == 1
         k1, k2 = self.kernel_size
         k1 = min(h, k1)
         k2 = min(w, k2)
@@ -302,6 +352,7 @@ class SpatialTransformer(nn.Module):
         self.nc = num_col
 
         import math
+
         step_j = k2 if num_col == 1 else math.ceil((w - k2) / (num_col - 1) - 1e-8)
         step_i = k1 if num_row == 1 else math.ceil((h - k1) / (num_row - 1) - 1e-8)
 
@@ -319,8 +370,8 @@ class SpatialTransformer(nn.Module):
                 if j + k2 >= w:
                     j = w - k2
                     last_j = True
-                parts.append(x[:, :, i:i + k1, j:j + k2])
-                idxes.append({'i': i, 'j': j})
+                parts.append(x[:, :, i : i + k1, j : j + k2])
+                idxes.append({"i": i, "j": j})
                 j = j + step_j
             i = i + step_i
 
@@ -338,10 +389,14 @@ class SpatialTransformer(nn.Module):
         k2 = min(w, k2)
 
         for cnt, each_idx in enumerate(self.idxes):
-            i = each_idx['i']
-            j = each_idx['j']
-            preds[0, :, i:i + k1, j:j + k2] += outs[cnt, :, :, :]
-            count_mt[0, 0, i:i + k1, j:j + k2] += 1.
+            i = each_idx["i"]
+            j = each_idx["j"]
+            # outs is [num_parts * b, c, k1, k2]
+            # outs[cnt * b : (cnt + 1) * b] corresponds to this part for all batches
+            preds[:, :, i : i + k1, j : j + k2] += outs[
+                cnt * b : (cnt + 1) * b, :, :, :
+            ]
+            count_mt[:, 0:1, i : i + k1, j : j + k2] += 1.0
 
         del outs
         torch.cuda.empty_cache()
@@ -354,9 +409,7 @@ class SpatialTransformer(nn.Module):
         # b, c, h, w = x.shape
         x_in = x
 
-
         x = self.grids(x)
-
 
         x = self.norm(x)
         b, c, h, w = x.shape
@@ -364,14 +417,14 @@ class SpatialTransformer(nn.Module):
         if not self.use_linear:
             x = self.proj_in(x)
 
-        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+        x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         if self.use_linear:
             x = self.proj_in(x)
         for i, block in enumerate(self.transformer_blocks):
             x = block(x, context=context[i])
         if self.use_linear:
             x = self.proj_out(x)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
         if not self.use_linear:
             x = self.proj_out(x)
 

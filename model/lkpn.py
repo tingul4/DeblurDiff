@@ -22,14 +22,14 @@ from string import Template
 from omegaconf import OmegaConf
 from model.unet import UNetModel
 
-Stream = namedtuple('Stream', ['ptr'])
+Stream = namedtuple("Stream", ["ptr"])
 
 
 def Dtype(t):
     if isinstance(t, torch.cuda.FloatTensor):
-        return 'float'
+        return "float"
     elif isinstance(t, torch.cuda.DoubleTensor):
-        return 'double'
+        return "double"
 
 
 @cupy._util.memoize(for_each_device=True)
@@ -45,19 +45,21 @@ CUDA_NUM_THREADS = 512
 # CUDA_NUM_THREADS = 1024   # FIXME: cuda
 
 
-kernel_loop = '''
+kernel_loop = """
 #define CUDA_KERNEL_LOOP(i, n)                        \
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; \
       i < (n);                                       \
       i += blockDim.x * gridDim.x)
-'''
+"""
 
 
 def GET_BLOCKS(N):
     return (N + CUDA_NUM_THREADS - 1) // CUDA_NUM_THREADS
 
 
-_idynamic_kernel = kernel_loop + '''
+_idynamic_kernel = (
+    kernel_loop
+    + """
 extern "C"
 __global__ void idynamic_forward_kernel(
 const ${Dtype}* bottom_data, const ${Dtype}* weight_data, ${Dtype}* top_data) {
@@ -87,9 +89,12 @@ const ${Dtype}* bottom_data, const ${Dtype}* weight_data, ${Dtype}* top_data) {
     top_data[index] = value;
   }
 }
-'''
+"""
+)
 
-_idynamic_kernel_backward_grad_input = kernel_loop + '''
+_idynamic_kernel_backward_grad_input = (
+    kernel_loop
+    + """
 extern "C"
 __global__ void idynamic_backward_grad_input_kernel(
     const ${Dtype}* const top_diff, const ${Dtype}* const weight_data, ${Dtype}* const bottom_diff) {
@@ -123,9 +128,12 @@ __global__ void idynamic_backward_grad_input_kernel(
     bottom_diff[index] = value;
   }
 }
-'''
+"""
+)
 
-_idynamic_kernel_backward_grad_weight = kernel_loop + '''
+_idynamic_kernel_backward_grad_weight = (
+    kernel_loop
+    + """
 extern "C"
 __global__ void idynamic_backward_grad_weight_kernel(
     const ${Dtype}* const top_diff, const ${Dtype}* const bottom_data, ${Dtype}* const buffer_data) {
@@ -156,7 +164,8 @@ __global__ void idynamic_backward_grad_weight_kernel(
     }
   }
 }
-'''
+"""
+)
 
 
 class _idynamic(Function):
@@ -166,25 +175,46 @@ class _idynamic(Function):
         assert weight.dim() == 6 and weight.is_cuda
         batch_size, channels, height, width = input.size()
         kernel_h, kernel_w = weight.size()[2:4]
-        output_h = int((height + 2 * padding[0] - (dilation[0] * (kernel_h - 1) + 1)) / stride[0] + 1)
-        output_w = int((width + 2 * padding[1] - (dilation[1] * (kernel_w - 1) + 1)) / stride[1] + 1)
+        output_h = int(
+            (height + 2 * padding[0] - (dilation[0] * (kernel_h - 1) + 1)) / stride[0]
+            + 1
+        )
+        output_w = int(
+            (width + 2 * padding[1] - (dilation[1] * (kernel_w - 1) + 1)) / stride[1]
+            + 1
+        )
 
         output = input.new(batch_size, channels, output_h, output_w)
         n = output.numel()
 
         with torch.cuda.device_of(input):
-            f = load_kernel('idynamic_forward_kernel', _idynamic_kernel, Dtype=Dtype(input), nthreads=n,
-                            num=batch_size, channels=channels, groups=weight.size()[1],
-                            bottom_height=height, bottom_width=width,
-                            top_height=output_h, top_width=output_w,
-                            kernel_h=kernel_h, kernel_w=kernel_w,
-                            stride_h=stride[0], stride_w=stride[1],
-                            dilation_h=dilation[0], dilation_w=dilation[1],
-                            pad_h=padding[0], pad_w=padding[1])
-            f(block=(CUDA_NUM_THREADS, 1, 1),
-              grid=(GET_BLOCKS(n), 1, 1),
-              args=[input.data_ptr(), weight.data_ptr(), output.data_ptr()],
-              stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+            f = load_kernel(
+                "idynamic_forward_kernel",
+                _idynamic_kernel,
+                Dtype=Dtype(input),
+                nthreads=n,
+                num=batch_size,
+                channels=channels,
+                groups=weight.size()[1],
+                bottom_height=height,
+                bottom_width=width,
+                top_height=output_h,
+                top_width=output_w,
+                kernel_h=kernel_h,
+                kernel_w=kernel_w,
+                stride_h=stride[0],
+                stride_w=stride[1],
+                dilation_h=dilation[0],
+                dilation_w=dilation[1],
+                pad_h=padding[0],
+                pad_w=padding[1],
+            )
+            f(
+                block=(CUDA_NUM_THREADS, 1, 1),
+                grid=(GET_BLOCKS(n), 1, 1),
+                args=[input.data_ptr(), weight.data_ptr(), output.data_ptr()],
+                stream=Stream(ptr=torch.cuda.current_stream().cuda_stream),
+            )
 
         ctx.save_for_backward(input, weight)
         ctx.stride, ctx.padding, ctx.dilation = stride, padding, dilation
@@ -204,53 +234,82 @@ class _idynamic(Function):
 
         grad_input, grad_weight = None, None
 
-        opt = dict(Dtype=Dtype(grad_output),
-                   num=batch_size, channels=channels, groups=weight.size()[1],
-                   bottom_height=height, bottom_width=width,
-                   top_height=output_h, top_width=output_w,
-                   kernel_h=kernel_h, kernel_w=kernel_w,
-                   stride_h=stride[0], stride_w=stride[1],
-                   dilation_h=dilation[0], dilation_w=dilation[1],
-                   pad_h=padding[0], pad_w=padding[1])
+        opt = dict(
+            Dtype=Dtype(grad_output),
+            num=batch_size,
+            channels=channels,
+            groups=weight.size()[1],
+            bottom_height=height,
+            bottom_width=width,
+            top_height=output_h,
+            top_width=output_w,
+            kernel_h=kernel_h,
+            kernel_w=kernel_w,
+            stride_h=stride[0],
+            stride_w=stride[1],
+            dilation_h=dilation[0],
+            dilation_w=dilation[1],
+            pad_h=padding[0],
+            pad_w=padding[1],
+        )
 
         with torch.cuda.device_of(input):
             if ctx.needs_input_grad[0]:
-                grad_input = input.new(input.size())
+                grad_input = torch.zeros_like(input)
 
                 n = grad_input.numel()
-                opt['nthreads'] = n
+                opt["nthreads"] = n
 
-                f = load_kernel('idynamic_backward_grad_input_kernel',
-                                _idynamic_kernel_backward_grad_input, **opt)
-                f(block=(CUDA_NUM_THREADS, 1, 1),
-                  grid=(GET_BLOCKS(n), 1, 1),
-                  args=[grad_output.data_ptr(), weight.data_ptr(), grad_input.data_ptr()],
-                  stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+                f = load_kernel(
+                    "idynamic_backward_grad_input_kernel",
+                    _idynamic_kernel_backward_grad_input,
+                    **opt,
+                )
+                f(
+                    block=(CUDA_NUM_THREADS, 1, 1),
+                    grid=(GET_BLOCKS(n), 1, 1),
+                    args=[
+                        grad_output.data_ptr(),
+                        weight.data_ptr(),
+                        grad_input.data_ptr(),
+                    ],
+                    stream=Stream(ptr=torch.cuda.current_stream().cuda_stream),
+                )
 
             if ctx.needs_input_grad[1]:
-                grad_weight = weight.new(weight.size())
+                grad_weight = torch.zeros_like(weight)
 
                 n = grad_weight.numel()
-                opt['nthreads'] = n
+                opt["nthreads"] = n
 
-                f = load_kernel('idynamic_backward_grad_weight_kernel',
-                                _idynamic_kernel_backward_grad_weight, **opt)
-                f(block=(CUDA_NUM_THREADS, 1, 1),
-                  grid=(GET_BLOCKS(n), 1, 1),
-                  args=[grad_output.data_ptr(), input.data_ptr(), grad_weight.data_ptr()],
-                  stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+                f = load_kernel(
+                    "idynamic_backward_grad_weight_kernel",
+                    _idynamic_kernel_backward_grad_weight,
+                    **opt,
+                )
+                f(
+                    block=(CUDA_NUM_THREADS, 1, 1),
+                    grid=(GET_BLOCKS(n), 1, 1),
+                    args=[
+                        grad_output.data_ptr(),
+                        input.data_ptr(),
+                        grad_weight.data_ptr(),
+                    ],
+                    stream=Stream(ptr=torch.cuda.current_stream().cuda_stream),
+                )
 
         return grad_input, grad_weight, None, None, None
 
 
 def _idynamic_cuda(input, weight, bias=None, stride=1, padding=0, dilation=1):
-    """ idynamic kernel
-    """
+    """idynamic kernel"""
     assert input.size(0) == weight.size(0)
     assert input.size(-2) // stride == weight.size(-2)
     assert input.size(-1) // stride == weight.size(-1)
     if input.is_cuda:
-        out = _idynamic.apply(input, weight, _pair(stride), _pair(padding), _pair(dilation))
+        out = _idynamic.apply(
+            input, weight, _pair(stride), _pair(padding), _pair(dilation)
+        )
         if bias is not None:
             out += bias.view(1, -1, 1, 1)
     else:
@@ -260,7 +319,7 @@ def _idynamic_cuda(input, weight, bias=None, stride=1, padding=0, dilation=1):
 
 class IDynamicConv(nn.Module):
     """
-        IDynamicDWConv: HyperNet for the weight of DynamicDWConv
+    IDynamicDWConv: HyperNet for the weight of DynamicDWConv
     """
 
     def __init__(self):
@@ -278,33 +337,47 @@ class IDynamicConv(nn.Module):
     def forward(self, x, weight):
         b, c, h, w = weight.shape
 
-        weight = weight.view(b, c // (self.kernel_size * self.kernel_size), self.kernel_size, self.kernel_size, h, w)
+        weight = weight.view(
+            b,
+            c // (self.kernel_size * self.kernel_size),
+            self.kernel_size,
+            self.kernel_size,
+            h,
+            w,
+        )
         out = _idynamic_cuda(x, weight, stride=1, padding=(self.kernel_size - 1) // 2)
         return out
 
 
 class LKPN(nn.Module):
-
     def __init__(self) -> "LKPN":
         super(LKPN, self).__init__()
 
-
-        self.unet = UNetModel(use_checkpoint=True, image_size=32, in_channels=8, out_channels=4*5*5, model_channels=128,
-                              attention_resolutions=[4, 2, 1],
-                              num_res_blocks=2, channel_mult=[1, 2, 4, 4], num_head_channels=64,
-                              use_spatial_transformer=True, use_linear_in_transformer=True,
-                              transformer_depth=1, context_dim=1024, legacy=False)
+        self.unet = UNetModel(
+            use_checkpoint=True,
+            image_size=32,
+            in_channels=8,
+            out_channels=4 * 5 * 5,
+            model_channels=128,
+            attention_resolutions=[4, 2, 1],
+            num_res_blocks=2,
+            channel_mult=[1, 2, 4, 4],
+            num_head_channels=64,
+            use_spatial_transformer=True,
+            use_linear_in_transformer=True,
+            transformer_depth=1,
+            context_dim=1024,
+            legacy=False,
+        )
 
         self.idy_conv = IDynamicConv()
 
-
-    def forward(self, x, hint,timesteps, context):
+    def forward(self, x, hint, timesteps, context):
 
         merge = torch.cat([x, hint], dim=1)
 
-        kernel = self.unet(x=merge,timesteps=timesteps,context=context)
+        kernel = self.unet(x=merge, timesteps=timesteps, context=context)
 
-        result = self.idy_conv(x, kernel)+x
+        result = self.idy_conv(x, kernel) + x
 
         return result
-
