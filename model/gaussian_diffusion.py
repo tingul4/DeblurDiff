@@ -103,7 +103,7 @@ class Diffusion(nn.Module):
     def p_losses(self, model, x_start, t, cond):
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output,lr_kpn = model(x_noisy, t, cond)
+        model_output, lr_kpn = model(x_noisy, t, cond)
 
         if self.parameterization == "x0":
             target = x_start
@@ -116,5 +116,16 @@ class Diffusion(nn.Module):
 
         loss_simple = self.get_loss(model_output, target, mean=False).mean()
         loss_kpn = self.get_loss(lr_kpn, x_start, mean=False).mean()
-        loss = loss_kpn+loss_simple
+        loss = loss_kpn + loss_simple
+
+        # EAC gate supervision loss (if model supports it)
+        if hasattr(model, 'module'):
+            # Accelerate wraps model
+            real_model = model.module
+        else:
+            real_model = model
+        if hasattr(real_model, 'compute_gate_loss'):
+            loss_gate = real_model.compute_gate_loss(cond)
+            loss = loss + loss_gate
+
         return loss
