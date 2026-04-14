@@ -89,11 +89,13 @@ def log_validation_images(
         batch = dataset[idx]
         lq = (
             torch.tensor(batch["lq"]).permute(2, 0, 1).unsqueeze(0).float().to(device)
-        )  # (1,3,H,W)
+        )  # (1,3,H,W) in [0,1]
         gt = torch.tensor(batch["gt"]).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        # gt is in [-1,1] from dataset
 
         z_0 = pure_cldm.vae_encode(gt)
-        cond = pure_cldm.prepare_condition(lq, [batch["prompt"]])
+        # VAE expects [-1,1]; lq is [0,1] from dataset
+        cond = pure_cldm.prepare_condition(lq * 2 - 1, [batch["prompt"]])
 
         if "depth" in batch:
             depth = torch.tensor(batch["depth"]).float().to(device)
@@ -115,7 +117,9 @@ def log_validation_images(
             uncond["defocus_map"] = cond["defocus_map"]
 
         h, w = z_0.shape[-2:]
-        x_T = torch.randn((1, 4, h, w), dtype=torch.float32, device=device)
+        # Fix per-sample seed so validation metrics are deterministic across steps
+        gen = torch.Generator(device=device).manual_seed(1234 + idx)
+        x_T = torch.randn((1, 4, h, w), dtype=torch.float32, device=device, generator=gen)
         z = sampler.sample(
             model=pure_cldm,
             device=device,
@@ -138,32 +142,23 @@ def log_validation_images(
         sample = sample.clamp(0, 1)
         lq_vis = lq.clamp(0, 1)
 
-        gt_vis = (
-            gt + 1
-        ) / 2  # Assuming gt is also in [-1, 1], adjust if it's already [0, 1]
-        if batch["gt"].max() <= 1.0 and batch["gt"].min() >= 0.0:
-            gt_vis = gt_vis = (
-                gt  # DPDDDataset usually returns gt in [0, 1] or [-1, 1]? Let's handle generic format
-            )
-
-        gt_vis = (
-            torch.tensor(batch["gt"]).permute(2, 0, 1).unsqueeze(0).float().to(device)
-        )
+        # gt is [-1,1] from dataset → convert to [0,1] for metrics
+        gt_vis = (gt + 1) / 2
+        gt_vis = gt_vis.clamp(0, 1)
 
         all_lq.append(lq_vis[0])
         all_sample.append(sample[0])
 
-        # Compute metrics
+        # Compute metrics — both sample and gt_vis are in [0,1]
         img1 = sample[0].cpu().numpy().transpose(1, 2, 0)
         img2 = gt_vis[0].cpu().numpy().transpose(1, 2, 0)
 
         val_psnr.append(psnr(img2, img1, data_range=1.0))
         val_ssim.append(ssim(img2, img1, data_range=1.0, channel_axis=-1))
 
-        # LPIPS expects [-1, 1]
-        sample_lpips = (sample * 2) - 1
-        gt_lpips = (gt_vis * 2) - 1
-        val_lpips.append(lpips_fn(sample_lpips, gt_lpips).item())
+        # LPIPS expects [-1, 1] — gt is already [-1,1], sample needs conversion
+        sample_lpips = sample * 2 - 1
+        val_lpips.append(lpips_fn(sample_lpips, gt).item())
 
     if all_lq:
         grid_lq = make_grid(all_lq, nrow=n_vis, normalize=False)
@@ -488,7 +483,7 @@ def main(args) -> None:
                             writer,
                             global_step,
                             device,
-                            n_vis=4,
+                            n_vis=8,
                             steps=50,
                         )
                     except Exception as e:

@@ -10,8 +10,8 @@
 set -euo pipefail
 
 # ---- Configuration ----
-export CUDA_VISIBLE_DEVICES=0,1
-NUM_GPUS=2
+export CUDA_VISIBLE_DEVICES=1
+NUM_GPUS=1
 MAIN_PORT=4562
 CONFIG=configs/train/train_dpdd.yaml
 EXP_DIR=exp_dpdd_defocus

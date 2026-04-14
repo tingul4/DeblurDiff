@@ -98,7 +98,7 @@ train:
   learning_rate: 1e-5
   eta_min: 1e-7
   T_max: 50000
-  batch_size: 1
+  batch_size: 2
   num_workers: 8
   train_steps: 200000
   log_every: 50
