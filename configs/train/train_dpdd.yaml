@@ -89,6 +89,26 @@ dataset:
       depth_subdir: depth_map_depthpro
       defocus_subdir: null
       prompt_prob: 0.5
+  val:
+    target: dataset.dpdd.DPDDDataset
+    params:
+      dataset_root: /raid/danielchen/defous-deblur/dd_dp_dataset_png
+      split: val
+      out_size: 512
+      crop_type: random
+      depth_subdir: depth_map_depthpro
+      defocus_subdir: null
+      prompt_prob: 0.5
+  test:
+    target: dataset.dpdd.DPDDDataset
+    params:
+      dataset_root: /raid/danielchen/defous-deblur/dd_dp_dataset_png
+      split: test
+      out_size: 512
+      crop_type: center
+      depth_subdir: depth_map_depthpro
+      defocus_subdir: null
+      prompt_prob: 0.0
 
 train:
   sd_path: checkpoints/v2-1_768-ema-pruned.safetensors

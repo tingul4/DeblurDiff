@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torchvision.utils import make_grid
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -33,6 +33,47 @@ from model.cldm_defocus import ControlLDMDefocus
 from model.gaussian_diffusion import Diffusion
 from utils.common import instantiate_from_config
 from utils.sampler import SpacedSampler
+
+
+class EMA:
+    """Exponential Moving Average of trainable parameters.
+
+    Maintains shadow copies of each trainable param. After each optimizer
+    step, shadow = decay * shadow + (1 - decay) * current.
+    For validation, call `apply_shadow()` then `restore()` afterwards.
+    """
+
+    def __init__(self, params, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = [p.detach().clone() for p in params]
+        self.backup = []
+        self._params_ref = params
+
+    @torch.no_grad()
+    def update(self):
+        for s, p in zip(self.shadow, self._params_ref):
+            if p.requires_grad:
+                s.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self):
+        self.backup = [p.detach().clone() for p in self._params_ref]
+        for p, s in zip(self._params_ref, self.shadow):
+            p.data.copy_(s.data)
+
+    @torch.no_grad()
+    def restore(self):
+        for p, b in zip(self._params_ref, self.backup):
+            p.data.copy_(b.data)
+        self.backup = []
+
+    def state_dict(self):
+        return {"decay": self.decay, "shadow": [s.cpu() for s in self.shadow]}
+
+    def load_state_dict(self, sd):
+        self.decay = sd["decay"]
+        for s, loaded in zip(self.shadow, sd["shadow"]):
+            s.data.copy_(loaded.to(s.device))
 
 
 def load_sd_weights(path: str) -> dict:
@@ -81,7 +122,7 @@ def log_validation_images(
         range(0, min(len(dataset), n_vis * 10), max(1, len(dataset) // n_vis))
     )[:n_vis]
 
-    all_lq, all_sample = [], []
+    all_lq, all_sample, all_gt = [], [], []
     val_psnr, val_ssim, val_lpips = [], [], []
     lpips_fn = lpips.LPIPS(net="vgg").to(device)
 
@@ -148,6 +189,7 @@ def log_validation_images(
 
         all_lq.append(lq_vis[0])
         all_sample.append(sample[0])
+        all_gt.append(gt_vis[0])
 
         # Compute metrics — both sample and gt_vis are in [0,1]
         img1 = sample[0].cpu().numpy().transpose(1, 2, 0)
@@ -163,8 +205,10 @@ def log_validation_images(
     if all_lq:
         grid_lq = make_grid(all_lq, nrow=n_vis, normalize=False)
         grid_sample = make_grid(all_sample, nrow=n_vis, normalize=False)
-        grid = make_grid([grid_lq, grid_sample], nrow=1, normalize=False)
-        writer.add_image("val/lq_vs_sample", grid, global_step)
+        grid_gt = make_grid(all_gt, nrow=n_vis, normalize=False)
+        # Row order: LQ (blurred input) / Sample (prediction) / GT (sharp target)
+        grid = make_grid([grid_lq, grid_sample, grid_gt], nrow=1, normalize=False)
+        writer.add_image("val/lq_sample_gt", grid, global_step)
 
         avg_psnr = np.mean(val_psnr)
         avg_ssim = np.mean(val_ssim)
@@ -269,8 +313,11 @@ def main(args) -> None:
         ]
     )
 
-    # Setup data
-    dataset = instantiate_from_config(cfg.dataset.train)
+    # Setup data — concat train + val as training set, use test as held-out validation
+    train_part = instantiate_from_config(cfg.dataset.train)
+    val_part = instantiate_from_config(cfg.dataset.val)
+    dataset = ConcatDataset([train_part, val_part])
+    test_dataset = instantiate_from_config(cfg.dataset.test)
     loader = DataLoader(
         dataset=dataset,
         batch_size=cfg.train.batch_size,
@@ -279,13 +326,26 @@ def main(args) -> None:
         drop_last=True,
     )
     if accelerator.is_local_main_process:
-        print(f"Dataset contains {len(dataset):,} images")
+        print(
+            f"Training set (train+val): {len(dataset):,} images "
+            f"(train={len(train_part):,}, val={len(val_part):,}); "
+            f"Held-out test set: {len(test_dataset):,} images"
+        )
 
     # Prepare models for training
     cldm.train().to(device)
     diffusion.to(device)
     cldm, opt, loader = accelerator.prepare(cldm, opt, loader)
     pure_cldm: ControlLDMDefocus = accelerator.unwrap_model(cldm)
+
+    # EMA over all trainable params (ControlNet + KPN + EAC gate) —
+    # built AFTER .to(device) + accelerator.prepare so shadow tensors live on GPU
+    ema_params = (
+        list(pure_cldm.controlnet.parameters())
+        + list(pure_cldm.kpn.parameters())
+        + list(pure_cldm.eac_gate.parameters())
+    )
+    ema = EMA(ema_params, decay=cfg.train.get("ema_decay", 0.9999))
 
     # Variables for monitoring
     global_step = 0
@@ -379,6 +439,7 @@ def main(args) -> None:
                 continue
 
             opt.step()
+            ema.update()
 
             accelerator.wait_for_everyone()
 
@@ -464,22 +525,30 @@ def main(args) -> None:
             # Save checkpoint
             if global_step % cfg.train.ckpt_every == 0 and global_step > 0:
                 if accelerator.is_local_main_process:
-                    checkpoint = pure_cldm.state_dict()
                     ckpt_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    # Save raw weights
                     ckpt_path = os.path.join(
                         ckpt_dir, f"step_{global_step:07d}_{ckpt_ts}.pt"
                     )
-                    torch.save(checkpoint, ckpt_path)
-                    print(f"Saved checkpoint to {ckpt_path}")
+                    torch.save(pure_cldm.state_dict(), ckpt_path)
+                    # Save EMA weights (preferred for inference)
+                    ema.apply_shadow()
+                    ema_ckpt_path = os.path.join(
+                        ckpt_dir, f"step_{global_step:07d}_{ckpt_ts}_ema.pt"
+                    )
+                    torch.save(pure_cldm.state_dict(), ema_ckpt_path)
+                    ema.restore()
+                    print(f"Saved checkpoint to {ckpt_path} (+ EMA)")
 
             # Log validation images
             if global_step % cfg.train.image_every == 0 and global_step > 0:
                 if accelerator.is_local_main_process:
+                    ema.apply_shadow()
                     try:
                         log_validation_images(
                             pure_cldm,
                             sampler,
-                            dataset,
+                            test_dataset,
                             writer,
                             global_step,
                             device,
@@ -488,6 +557,8 @@ def main(args) -> None:
                         )
                     except Exception as e:
                         print(f"Warning: validation image logging failed: {e}")
+                    finally:
+                        ema.restore()
 
             accelerator.wait_for_everyone()
             if global_step == max_steps:
