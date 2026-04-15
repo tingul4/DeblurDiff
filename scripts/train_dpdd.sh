@@ -41,7 +41,7 @@ echo "Exp dir:     ${EXP_DIR}"
 echo "--------------------------------------------"
 
 # Check SD weights exist
-SD_WEIGHTS=checkpoints/v2-1_768-ema-pruned.safetensors
+SD_WEIGHTS=checkpoints/v2-1_512-ema-pruned.safetensors
 if [[ ! -f "$SD_WEIGHTS" ]]; then
     echo "ERROR: SD weights not found at $SD_WEIGHTS"
     exit 1

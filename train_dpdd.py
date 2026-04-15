@@ -138,22 +138,18 @@ def log_validation_images(
         # VAE expects [-1,1]; lq is [0,1] from dataset
         cond = pure_cldm.prepare_condition(lq * 2 - 1, [batch["prompt"]])
 
-        if "depth" in batch:
-            depth = torch.tensor(batch["depth"]).float().to(device)
-            if depth.ndim == 2:
-                depth = depth.unsqueeze(0).unsqueeze(0)
-            elif depth.ndim == 3:
-                depth = depth.unsqueeze(1)
-            d_flat = depth.view(1, -1)
-            d_min = d_flat.min(dim=1, keepdim=True)[0].view(1, 1, 1, 1)
-            d_max = d_flat.max(dim=1, keepdim=True)[0].view(1, 1, 1, 1)
-            defocus_map = (depth - d_min) / (d_max - d_min + 1e-8)
-            defocus_map = F.interpolate(
-                defocus_map, size=z_0.shape[-2:], mode="bilinear", align_corners=False
+        if "defocus" in batch:
+            defocus = torch.tensor(batch["defocus"]).float().to(device)
+            if defocus.ndim == 2:
+                defocus = defocus.unsqueeze(0).unsqueeze(0)
+            elif defocus.ndim == 3:
+                defocus = defocus.unsqueeze(1)
+            defocus = F.interpolate(
+                defocus, size=z_0.shape[-2:], mode="bilinear", align_corners=False
             )
-            cond["defocus_map"] = defocus_map
+            cond["defocus_map"] = defocus
 
-        uncond = pure_cldm.prepare_condition(lq, [""])
+        uncond = pure_cldm.prepare_condition(lq * 2 - 1, [""])
         if "defocus_map" in cond:
             uncond["defocus_map"] = cond["defocus_map"]
 
@@ -381,25 +377,7 @@ def main(args) -> None:
                 cond = pure_cldm.prepare_condition(clean, prompt)
 
                 # Prepare defocus map for latent space
-                if "depth" in batch:
-                    depth = batch["depth"].float().to(device)  # (B, H, W)
-                    if depth.ndim == 3:
-                        depth = depth.unsqueeze(1)  # (B, 1, H, W)
-                    # Normalise depth to [0, 1] as defocus proxy
-                    b = depth.shape[0]
-                    depth_flat = depth.view(b, -1)
-                    d_min = depth_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                    d_max = depth_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                    defocus_map = (depth - d_min) / (d_max - d_min + 1e-8)
-                    # Resize to latent space
-                    defocus_map = F.interpolate(
-                        defocus_map,
-                        size=z_0.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    cond["defocus_map"] = defocus_map
-                elif "defocus" in batch:
+                if "defocus" in batch:
                     defocus = batch["defocus"].float().to(device)
                     if defocus.ndim == 3:
                         defocus = defocus.unsqueeze(1)

@@ -86,8 +86,8 @@ dataset:
       split: train
       out_size: 512
       crop_type: random
-      depth_subdir: depth_map_depthpro
-      defocus_subdir: null
+      depth_subdir: null
+      defocus_subdir: pseudo_defocus_map
       prompt_prob: 0.5
   val:
     target: dataset.dpdd.DPDDDataset
@@ -96,8 +96,8 @@ dataset:
       split: val
       out_size: 512
       crop_type: random
-      depth_subdir: depth_map_depthpro
-      defocus_subdir: null
+      depth_subdir: null
+      defocus_subdir: pseudo_defocus_map
       prompt_prob: 0.5
   test:
     target: dataset.dpdd.DPDDDataset
@@ -106,21 +106,21 @@ dataset:
       split: test
       out_size: 512
       crop_type: center
-      depth_subdir: depth_map_depthpro
-      defocus_subdir: null
+      depth_subdir: null
+      defocus_subdir: pseudo_defocus_map
       prompt_prob: 0.0
 
 train:
-  sd_path: checkpoints/v2-1_768-ema-pruned.safetensors
+  sd_path: checkpoints/v2-1_512-ema-pruned.safetensors
   resume: null
   resume_kpn: null
   exp_dir: exp_dpdd_defocus
   learning_rate: 1e-5
   eta_min: 1e-7
   T_max: 50000
-  batch_size: 2
+  batch_size: 4
   num_workers: 8
-  train_steps: 200000
+  train_steps: 100000
   log_every: 50
-  ckpt_every: 4000
-  image_every: 1000
+  ckpt_every: 2000
+  image_every: 500
