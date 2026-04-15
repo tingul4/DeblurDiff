@@ -317,20 +317,29 @@ class SpacedSampler(nn.Module):
             x_T: Optional[torch.Tensor] = None,
             progress: bool = True,
             progress_leave: bool = True,
+            t_start: Optional[int] = None,
     ) -> torch.Tensor:
         self.make_schedule(steps)
         self.to(device)
         if x_T is None:
-            # TODO: not convert to float32, may trigger an error
             img = torch.randn((batch_size, *x_size), device=device)
         else:
             img = x_T
         timesteps = np.flip(self.timesteps)  # [1000, 950, 900, ...]
+        if t_start is not None:
+            timesteps = timesteps[timesteps <= t_start]
         total_steps = len(self.timesteps)
-        iterator = tqdm(timesteps, total=total_steps, leave=progress_leave, disable=not progress)
+        iterator = tqdm(timesteps, total=len(timesteps), leave=progress_leave, disable=not progress)
+        
+        # Calculate the original index offset
+        original_timesteps = np.flip(self.timesteps)
+        start_i = len(original_timesteps) - len(timesteps)
+        
         for i, step in enumerate(iterator):
             ts = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            index = torch.full_like(ts, fill_value=total_steps - i - 1)
+            # The index is the position from 1 to T... wait, it's used to look up betas
+            orig_i = start_i + i
+            index = torch.full_like(ts, fill_value=total_steps - orig_i - 1)
             img, kpn = self.p_sample(
                 model, img, ts, index, cond, uncond, cfg_scale, cond_fn,
                 tiled, tile_size, tile_stride

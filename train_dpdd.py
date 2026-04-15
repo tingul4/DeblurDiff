@@ -108,6 +108,7 @@ def log_txt_as_img(wh, xc):
 @torch.no_grad()
 def log_validation_images(
     pure_cldm,
+    diffusion,
     sampler,
     dataset,
     writer,
@@ -136,7 +137,8 @@ def log_validation_images(
 
         z_0 = pure_cldm.vae_encode(gt)
         # VAE expects [-1,1]; lq is [0,1] from dataset
-        cond = pure_cldm.prepare_condition(lq * 2 - 1, [batch["prompt"]])
+        z_lq = pure_cldm.vae_encode(lq * 2 - 1)
+        cond = pure_cldm.prepare_condition(lq * 2 - 1, [""])
 
         if "defocus" in batch:
             defocus = torch.tensor(batch["defocus"]).float().to(device)
@@ -156,7 +158,17 @@ def log_validation_images(
         h, w = z_0.shape[-2:]
         # Fix per-sample seed so validation metrics are deterministic across steps
         gen = torch.Generator(device=device).manual_seed(1234 + idx)
-        x_T = torch.randn((1, 4, h, w), dtype=torch.float32, device=device, generator=gen)
+
+        # SDEdit-style inference starting point
+        t_start = int(0.5 * 1000)  # Assuming diffusion num_timesteps = 1000
+        noise = torch.randn(
+            (1, 4, h, w), dtype=torch.float32, device=device, generator=gen
+        )
+        # Using diffusion directly
+        x_T = diffusion.q_sample(
+            z_lq, torch.tensor([t_start - 1], device=device), noise=noise
+        )
+
         z = sampler.sample(
             model=pure_cldm,
             device=device,
@@ -173,6 +185,7 @@ def log_validation_images(
             tiled=False,
             tile_size=512,
             tile_stride=256,
+            t_start=t_start - 1,
         )
         sample = pure_cldm.vae_decode(z)
         sample = (sample + 1) / 2  # [-1,1] → [0,1]
@@ -365,7 +378,7 @@ def main(args) -> None:
             # DPDDDataset returns dict with 'gt', 'lq', 'prompt', optionally 'depth'
             gt = batch["gt"]
             lq = batch["lq"]
-            prompt = batch["prompt"]
+            prompt = [""] * gt.shape[0]  # Force null prompt as suggested
 
             gt = rearrange(gt, "b h w c -> b c h w").contiguous().float().to(device)
             lq = rearrange(lq, "b h w c -> b c h w").contiguous().float().to(device)
@@ -389,9 +402,9 @@ def main(args) -> None:
                     )
                     cond["defocus_map"] = defocus
 
-            t = torch.randint(
-                0, diffusion.num_timesteps, (z_0.shape[0],), device=device
-            )
+            # SDEdit-style timestep restriction for Image Restoration
+            max_t = int(0.5 * diffusion.num_timesteps)
+            t = torch.randint(0, max_t, (z_0.shape[0],), device=device)
             loss, loss_dict = diffusion.p_losses(cldm, z_0, t, cond, return_dict=True)
 
             # Prevent gradient explosion from nan or inf loss
@@ -525,6 +538,7 @@ def main(args) -> None:
                     try:
                         log_validation_images(
                             pure_cldm,
+                            diffusion,
                             sampler,
                             test_dataset,
                             writer,
