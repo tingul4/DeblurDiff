@@ -238,6 +238,9 @@ def main(args) -> None:
     set_seed(231)
     device = accelerator.device
     cfg = OmegaConf.load(args.config)
+    OmegaConf.set_struct(cfg, False)
+    if hasattr(args, "resume") and args.resume:
+        cfg.train.resume = args.resume
 
     # Setup experiment folder with timestamp-based run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -274,12 +277,26 @@ def main(args) -> None:
             f"unused weights: {unused}"
         )
 
+    resume_step = 0
+    resume_epoch = 0
+    resume_opt = None
+    resume_ema = None
+
     if cfg.train.resume:
-        cldm.load_controlnet_from_ckpt(torch.load(cfg.train.resume, map_location="cpu"))
+        ckpt = torch.load(cfg.train.resume, map_location="cpu")
+        if "model_state_dict" in ckpt:  # New format with full state
+            model_sd = ckpt["model_state_dict"]
+            resume_step = ckpt.get("global_step", 0)
+            resume_epoch = ckpt.get("epoch", 0)
+            resume_opt = ckpt.get("optimizer_state_dict", None)
+            resume_ema = ckpt.get("ema_state_dict", None)
+            cldm.load_state_dict(model_sd, strict=False)
+        else:  # Old format (which was saved as full cldm state_dict but loaded incorrectly before)
+            model_sd = ckpt
+            cldm.load_state_dict(model_sd, strict=False)
+
         if accelerator.is_local_main_process:
-            print(
-                f"strictly load controlnet weight from checkpoint: {cfg.train.resume}"
-            )
+            print(f"strictly load model weight from checkpoint: {cfg.train.resume}")
     else:
         init_with_new_zero, init_with_scratch = cldm.load_controlnet_from_unet()
         if accelerator.is_local_main_process:
@@ -356,11 +373,21 @@ def main(args) -> None:
     )
     ema = EMA(ema_params, decay=cfg.train.get("ema_decay", 0.9999))
 
+    if resume_ema is not None:
+        ema.load_state_dict(resume_ema)
+        if accelerator.is_local_main_process:
+            print("Loaded EMA state from checkpoint.")
+
+    if resume_opt is not None:
+        opt.load_state_dict(resume_opt)
+        if accelerator.is_local_main_process:
+            print("Loaded Optimizer state from checkpoint.")
+
     # Variables for monitoring
-    global_step = 0
+    global_step = resume_step
     max_steps = cfg.train.train_steps
     step_losses = {"total": [], "simple": [], "kpn": [], "gate": []}
-    epoch = 0
+    epoch = resume_epoch
     epoch_loss = []
     sampler = SpacedSampler(diffusion.betas)
     if accelerator.is_local_main_process:
@@ -517,17 +544,34 @@ def main(args) -> None:
             if global_step % cfg.train.ckpt_every == 0 and global_step > 0:
                 if accelerator.is_local_main_process:
                     ckpt_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    state = {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "model_state_dict": pure_cldm.state_dict(),
+                        "optimizer_state_dict": opt.state_dict(),
+                        "ema_state_dict": ema.state_dict(),
+                    }
+
                     # Save raw weights
                     ckpt_path = os.path.join(
                         ckpt_dir, f"step_{global_step:07d}_{ckpt_ts}.pt"
                     )
-                    torch.save(pure_cldm.state_dict(), ckpt_path)
+                    torch.save(state, ckpt_path)
+
                     # Save EMA weights (preferred for inference)
                     ema.apply_shadow()
+                    ema_state = {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "model_state_dict": pure_cldm.state_dict(),
+                        "optimizer_state_dict": opt.state_dict(),
+                        "ema_state_dict": ema.state_dict(),
+                    }
                     ema_ckpt_path = os.path.join(
                         ckpt_dir, f"step_{global_step:07d}_{ckpt_ts}_ema.pt"
                     )
-                    torch.save(pure_cldm.state_dict(), ema_ckpt_path)
+                    torch.save(ema_state, ema_ckpt_path)
                     ema.restore()
                     print(f"Saved checkpoint to {ckpt_path} (+ EMA)")
 
@@ -571,5 +615,8 @@ def main(args) -> None:
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--resume", type=str, default="", help="path to checkpoint to resume training"
+    )
     args = parser.parse_args()
     main(args)

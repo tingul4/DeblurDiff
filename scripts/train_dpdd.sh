@@ -15,21 +15,7 @@ NUM_GPUS=1
 MAIN_PORT=4562
 CONFIG=configs/train/train_dpdd.yaml
 EXP_DIR=exp_dpdd_defocus
-
-# ---- Resume from checkpoint (optional) ----
-RESUME_FLAG=""
-if [[ "${1:-}" == "resume" ]]; then
-    # Find latest checkpoint
-    LATEST_CKPT=$(ls -1t "${EXP_DIR}/checkpoints/"*.pt 2>/dev/null | head -n1)
-    if [[ -n "$LATEST_CKPT" ]]; then
-        echo "Resuming from: $LATEST_CKPT"
-        # Temporarily patch config to set resume path
-        # (the config's train.resume field controls this)
-        RESUME_FLAG="--resume $LATEST_CKPT"
-    else
-        echo "No checkpoint found in ${EXP_DIR}/checkpoints/, training from scratch."
-    fi
-fi
+RESUME_PATH="/raid/danielchen/defous-deblur/DeblurDiff/exp_dpdd_defocus/run_20260416_162830/checkpoints/step_0004000_20260416_191326.pt"
 
 # ---- Pre-flight checks ----
 echo "============================================"
@@ -65,7 +51,8 @@ accelerate launch \
     --num_processes ${NUM_GPUS} \
     --main_process_port ${MAIN_PORT} \
     train_dpdd.py \
-    --config ${CONFIG}
+    --config ${CONFIG} \
+    --resume ${RESUME_PATH}
 
 echo ""
 echo "Training complete!"
